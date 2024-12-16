@@ -1,0 +1,30 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "KaryaTaskManagerApiStack"
+s3_bucket = "karya-app-deployment-bucket"
+s3_prefix = "karya-task-api"
+region = "us-east-1"
+capabilities = ["CAPABILITY_NAMED_IAM"]
+parameter_overrides = [
+    "ProjectName=karya",
+    "Environment=dev"
+]
+
+[dev.deploy.parameters]
+stack_name = "KaryaTaskManagerApiStack"
+resolve_s3 = true
+s3_prefix = "KaryaTaskManagerApiStack"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+disable_rollback = true
+parameter_overrides = [
+    "ProjectName=karya",
+    "Environment=dev",
+    "CognitoUserName=sajalshres",
+    "CognitoUserPassword=99Problems!"
+]
+image_repositories = []

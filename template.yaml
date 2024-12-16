@@ -1,0 +1,507 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: TODO API with AWS Serverless Architecture and Cognito Authentication
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: todo
+    Description: "Project name (lowercase only)"
+    AllowedPattern: "^[a-z0-9-]+$"
+    ConstraintDescription: "Must be lowercase alphanumeric or hyphens."
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - qa
+      - staging
+      - prod
+    Description: "Deployment environment"
+  CognitoUserName:
+    Type: String
+    Default: cognitouser
+    Description: Enter Cognito username.
+  CognitoUserPassword:
+    Type: String
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[\^$*.\[\]{}\(\)?\-“!@#%&/,><\’:;|_~`])\S{6,99}$'
+    Description: Enter Cognito users password.
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 15
+    MemorySize: 128
+
+Resources:
+  # Cognito User Pool
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${Environment}-userpool"
+
+  CognitoUserPoolDomain:
+    Type: "AWS::Cognito::UserPoolDomain"
+    Properties:
+      # using client id will make the domain unique
+      Domain: !Sub dns-name-${CognitoUserPoolClient}
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoUserPoolGroup:
+    Type: "AWS::Cognito::UserPoolGroup"
+    Properties:
+      GroupName: !Sub "${ProjectName}-group"
+      UserPoolId: !Ref CognitoUserPool
+    DependsOn:
+      - CognitoUserPool
+
+  CognitoUserPoolUserToGroupAttachment:
+    Type: "AWS::Cognito::UserPoolUserToGroupAttachment"
+    Properties:
+      GroupName: !Ref CognitoUserPoolGroup
+      Username: !Ref CognitoUserName
+      UserPoolId: !Ref CognitoUserPool
+    DependsOn:
+      - CognitoUserPoolGroup
+      - HelperInitializeCognitoUser
+
+  CognitoUserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+      CallbackURLs:
+        - "http://localhost"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+    DependsOn:
+      - CognitoUserPool
+
+  # DynamoDB Table
+  TodoTasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-${Environment}-tasks"
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: TaskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: TaskId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  AuthDynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Sub "${ProjectName}-${Environment}-auth-policy-store"
+      AttributeDefinitions:
+        - AttributeName: "group"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "group"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  # S3 Bucket for Attachments
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-attachments"
+
+  # SQS Queue for Reminders
+  ReminderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-reminders"
+
+  # SNS Topic for Email Notifications
+  ReminderTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-reminders-topic"
+
+  # API Gateway
+  TodoApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-api"
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: LambdaRequestAuthorizer
+        Authorizers:
+          LambdaRequestAuthorizer:
+            FunctionPayloadType: REQUEST
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            FunctionInvokeRole: !GetAtt ApiGatewayAuthIAMRole.Arn
+            Identity:
+              Headers:
+                - Authorization
+
+  # IAM
+  HelperCognitoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-helper-cognito-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${Environment}-helper-cognito-lambda-role-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:Admin*
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*-*:*
+
+  HelperDbLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-helper-db-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${Environment}-helper-db-lambda-role-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt AuthDynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*-*:*
+
+  ApiGatewayAuthIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-api-gateway-authorizer-iam-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-${Environment}-api-gateway-authorizer-iam-policy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: !GetAtt AuthorizerFunction.Arn
+
+  AuthorizerIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-authorizer-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CustomAuthPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:*
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-authorizer:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchGetItem
+                Resource: !GetAtt AuthDynamoDBTable.Arn
+
+  # Lambda Functions
+  HelperInitCognitoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      FunctionName: !Sub "${ProjectName}-${Environment}-helper-init-cognito"
+      CodeUri: src/lambdas/helper_init_cognito/
+      Role: !GetAtt HelperCognitoLambdaRole.Arn
+      Timeout: 30
+
+  HelperInitDbFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      FunctionName: !Sub "${ProjectName}-${Environment}-helper-init-db"
+      CodeUri: src/lambdas/helper_init_db/
+      Role: !GetAtt HelperDbLambdaRole.Arn
+      Timeout: 30
+
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.handler
+      FunctionName: !Sub "${ProjectName}-${Environment}-authorizer"
+      CodeUri: src/lambdas/authorizer/
+      Role: !GetAtt AuthorizerIamRole.Arn
+
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-auth-policy-store"
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_APP_CLIENT_ID: !Ref CognitoUserPoolClient
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/status/
+      FunctionName: !Sub "${ProjectName}-${Environment}-status"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTasksTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReminderQueue.QueueName
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ReminderQueue
+      Events:
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/status
+            Method: GET
+
+  CreateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/create_task/
+      FunctionName: !Sub "${ProjectName}-${Environment}-create-task"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTasksTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReminderQueue.QueueName
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ReminderQueue
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+      Events:
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/tasks
+            Method: POST
+
+  GetTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/get_tasks/
+      FunctionName: !Sub "${ProjectName}-${Environment}-get-tasks"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TodoTasksTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+      Events:
+        GetTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/tasks
+            Method: GET
+
+  UpdateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/update_task/
+      FunctionName: !Sub "${ProjectName}-${Environment}-update-task"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTasksTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+      Events:
+        UpdateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/tasks/{taskId}
+            Method: PUT
+
+  DeleteTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/delete_task/
+      FunctionName: !Sub "${ProjectName}-${Environment}-delete-task"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTasksTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+      Events:
+        DeleteTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/tasks/{taskId}
+            Method: DELETE
+
+  AttachFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/attach_file/
+      FunctionName: !Sub "${ProjectName}-${Environment}-attach-file"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTasksTable
+        - S3CrudPolicy:
+            BucketName: !Ref AttachmentsBucket
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+          BUCKET_NAME: !Sub "${ProjectName}-${Environment}-attachments"
+      Events:
+        AttachFile:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /api/tasks/{taskId}/attachments
+            Method: POST
+
+  TaskScannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/task_scanner/
+      FunctionName: !Sub "${ProjectName}-${Environment}-task-scanner"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TodoTasksTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ReminderQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReminderQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref ReminderTopic
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+          SQS_QUEUE_URL: !Ref ReminderQueue
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+
+  SendReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      CodeUri: src/lambdas/send_reminder/
+      FunctionName: !Sub "${ProjectName}-${Environment}-send-reminder"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TodoTasksTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ReminderQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref ReminderTopic
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub "${ProjectName}-${Environment}-tasks"
+          TOPIC_ARN: !Ref ReminderTopic
+      Events:
+        ReminderQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReminderQueue.Arn
+
+  # Custom Resource
+  HelperInitializeCognitoUser:
+    Type: Custom::HelperInitCognitoFunction
+    Properties:
+      ServiceToken: !GetAtt HelperInitCognitoFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      CognitoUserName: !Ref CognitoUserName
+      CognitoUserPassword: !Ref CognitoUserPassword
+
+  HelperDynamoDbInitializeDynamoDB:
+    Type: Custom::InitFunction
+    Properties:
+      ServiceToken: !GetAtt HelperInitDbFunction.Arn
+      DynamoTableName: !Ref AuthDynamoDBTable
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${TodoApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
+
+  TasksTableName:
+    Description: "Name of the DynamoDB table"
+    Value: !Ref TodoTasksTable
